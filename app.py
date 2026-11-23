@@ -8,7 +8,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from season_data import ARCHIVE, LOCAL_CSV, SEASON, VENUES, parse_season, query_season
+from season_data import ARCHIVE, LOCAL_CSV, SEASON, VENUES, download_season, parse_season, query_season
 
 ROOT = Path(__file__).parent
 COLORS = ["#c7f45c", "#7cd7fd"]
@@ -36,6 +36,30 @@ LOG_COLUMNS = {
 @st.cache_data(show_spinner=False)
 def load_season(raw):
     return query_season(parse_season(raw))
+
+
+@st.cache_data(ttl="1d", show_spinner="Loading the 2025–26 season…")
+def load_online_season():
+    return load_season(download_season())
+
+
+def dashboard_data():
+    if LOCAL_CSV.is_file():
+        return load_season(LOCAL_CSV.read_bytes())
+
+    if not st.session_state.get("season_source_unavailable"):
+        try:
+            return load_online_season()
+        except (OSError, ValueError):
+            st.session_state["season_source_unavailable"] = True
+
+    st.warning("The season data source is temporarily unavailable. Try again or upload the season CSV.")
+    if st.button("Retry download"):
+        st.session_state.pop("season_source_unavailable", None)
+        st.rerun()
+    st.link_button("Open the season archive", ARCHIVE)
+    upload = st.file_uploader(f"Upload the {SEASON} Premier League CSV", type=["csv"])
+    return load_season(upload.getvalue()) if upload is not None else None
 
 
 def masthead():
@@ -194,21 +218,15 @@ def main():
     st.set_page_config(page_title="Premier League Analytics", layout="wide")
     st.html(f"<style>{(ROOT / 'dashboard.css').read_text(encoding='utf-8')}</style>")
     masthead()
-    if LOCAL_CSV.is_file():
-        raw = LOCAL_CSV.read_bytes()
-    else:
-        st.info("Add the 2025–26 Premier League CSV to open the dashboard.")
-        st.link_button("Open the season archive", ARCHIVE)
-        upload = st.file_uploader("Upload the 2025–26 Premier League CSV", type=["csv"])
-        if upload is None:
-            hero()
-            return
-        raw = upload.getvalue()
     try:
-        league, logs = load_season(raw)
-    except ValueError as exc:
+        data = dashboard_data()
+    except (OSError, ValueError) as exc:
         st.error(str(exc))
         return
+    if data is None:
+        hero()
+        return
+    league, logs = data
     page = st.radio("Dashboard view", ["League overview", "Compare clubs"],
                     horizontal=True, label_visibility="collapsed", key="page")
     if page == "League overview":

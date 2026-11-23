@@ -55,6 +55,17 @@ def club_name(source_name):
     return CLUB_NAMES.get(source_name, source_name)
 
 
+def download_season():
+    """Fetch the season CSV with a bounded request and response size."""
+    request = Request(SOURCE, headers={"User-Agent": "Premier League Analytics/1.0"})
+    limit = 2_000_000
+    with urlopen(request, timeout=15) as response:
+        raw = response.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError("The downloaded file is larger than the expected season CSV.")
+    return raw
+
+
 def parse_season(raw):
     reader = csv.DictReader(StringIO(raw.decode("utf-8-sig")))
     if not set(FIELDS).issubset(reader.fieldnames or ()):
@@ -125,13 +136,7 @@ def main():
     mode.add_argument("--file", type=Path, help="Use a previously downloaded Football-Data CSV.")
     args = parser.parse_args()
     try:
-        if args.download:
-            with urlopen(Request(SOURCE, headers={"User-Agent": "Premier League Analytics/1.0"}), timeout=20) as response:
-                raw = response.read(2_000_001)
-            if len(raw) > 2_000_000:
-                raise ValueError("The downloaded file is larger than the expected season CSV.")
-        else:
-            raw = args.file.read_bytes()
+        raw = download_season() if args.download else args.file.read_bytes()
         matches = parse_season(raw)
         with NamedTemporaryFile(dir=LOCAL_CSV.parent, suffix=".tmp", delete=False) as handle:
             temporary = Path(handle.name)
