@@ -1,31 +1,32 @@
-"""Validate one complete season and query it as a team-per-match SQLite view."""
+"""Validate Premier League season files and query them as club-match views."""
 
 import argparse
 import csv
-from datetime import datetime
+from datetime import date, datetime
 from io import StringIO
 from pathlib import Path
 import sqlite3
 from tempfile import NamedTemporaryFile
 from urllib.request import Request, urlopen
 
-SEASON = "2025–26"
-SOURCE = "https://www.football-data.co.uk/mmz4281/2526/E0.csv"
+CURRENT_SEASON = 2026
+DEFAULT_SEASON = 2025
+SEASONS = tuple(range(CURRENT_SEASON, 2021, -1))
 ARCHIVE = "https://www.football-data.co.uk/englandm.php"
-LOCAL_CSV = Path(__file__).with_name("season-2025-26.csv")
 VENUES = ("All matches", "Home", "Away")
 CLUB_NAMES = {
     "Brighton": "Brighton & Hove Albion", "Leeds": "Leeds United",
+    "Coventry": "Coventry City", "Hull": "Hull City", "Ipswich": "Ipswich Town",
     "Man City": "Manchester City", "Man United": "Manchester United",
     "Newcastle": "Newcastle United", "Nott'm Forest": "Nottingham Forest",
     "Tottenham": "Tottenham Hotspur", "West Ham": "West Ham United",
     "Wolves": "Wolverhampton Wanderers",
 }
-CLUBS = frozenset({
-    "Arsenal", "Aston Villa", "Bournemouth", "Brentford", "Brighton", "Burnley",
-    "Chelsea", "Crystal Palace", "Everton", "Fulham", "Leeds", "Liverpool",
+CURRENT_CLUBS = frozenset({
+    "Arsenal", "Aston Villa", "Bournemouth", "Brentford", "Brighton", "Chelsea",
+    "Coventry", "Crystal Palace", "Everton", "Fulham", "Hull", "Ipswich", "Leeds", "Liverpool",
     "Man City", "Man United", "Newcastle", "Nott'm Forest", "Sunderland",
-    "Tottenham", "West Ham", "Wolves",
+    "Tottenham",
 })
 FIELDS = ("Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "HS", "AS", "HST", "AST")
 SCHEMA = """
@@ -55,9 +56,19 @@ def club_name(source_name):
     return CLUB_NAMES.get(source_name, source_name)
 
 
-def download_season():
+def season_label(season):
+    return f"{season}–{(season + 1) % 100:02}"
+
+
+def local_csv(season):
+    return Path(__file__).with_name(f"season-{season}-{(season + 1) % 100:02}.csv")
+
+
+def download_season(season=DEFAULT_SEASON):
     """Fetch the season CSV with a bounded request and response size."""
-    request = Request(SOURCE, headers={"User-Agent": "Premier League Analytics/1.0"})
+    code = f"{season % 100:02}{(season + 1) % 100:02}"
+    source = f"https://www.football-data.co.uk/mmz4281/{code}/E0.csv"
+    request = Request(source, headers={"User-Agent": "Premier League Analytics/1.0"})
     limit = 2_000_000
     with urlopen(request, timeout=15) as response:
         raw = response.read(limit + 1)
@@ -66,7 +77,7 @@ def download_season():
     return raw
 
 
-def parse_season(raw):
+def parse_season(raw, season=DEFAULT_SEASON):
     reader = csv.DictReader(StringIO(raw.decode("utf-8-sig")))
     if not set(FIELDS).issubset(reader.fieldnames or ()):
         raise ValueError("The CSV must contain match dates, teams, goals, shots and shots on target.")
@@ -78,25 +89,28 @@ def parse_season(raw):
         if not any(row.get(field) for field in FIELDS):
             continue
         try:
-            date = datetime.strptime(row["Date"], "%d/%m/%Y").date().isoformat()
-            home, away = row["HomeTeam"].strip(), row["AwayTeam"].strip()
+            played = datetime.strptime(row["Date"], "%d/%m/%Y").date()
+            home, away = club_name(row["HomeTeam"].strip()), club_name(row["AwayTeam"].strip())
             counts = tuple(int(row[column]) for column in FIELDS[3:])
         except (AttributeError, TypeError, ValueError) as exc:
             raise ValueError(f"Invalid date, team or match statistic on CSV row {reader.line_num}.") from exc
-        if not ("2025-08-01" <= date <= "2026-05-31") or row.get("Div", "E0") != "E0":
-            raise ValueError("The file must contain 2025–26 Premier League results.")
-        if home not in CLUBS or away not in CLUBS or home == away:
+        if not date(season, 8, 1) <= played <= date(season + 1, 5, 31) or row.get("Div", "E0") != "E0":
+            raise ValueError(f"The file must contain {season_label(season)} Premier League results.")
+        if not home or not away or home == away:
             raise ValueError(f"Unexpected fixture on CSV row {reader.line_num}.")
         if min(counts) < 0 or counts[4] > counts[2] or counts[5] > counts[3]:
             raise ValueError(f"Inconsistent shot or goal counts on CSV row {reader.line_num}.")
-        if (home, away) in fixtures or {(date, home), (date, away)} & dates_by_club:
+        if (home, away) in fixtures or {(played, home), (played, away)} & dates_by_club:
             raise ValueError(f"Duplicate fixture or club match date on CSV row {reader.line_num}.")
         fixtures.add((home, away))
-        dates_by_club.update(((date, home), (date, away)))
-        matches.append((date, club_name(home), club_name(away), *counts))
+        dates_by_club.update(((played, home), (played, away)))
+        matches.append((played.isoformat(), home, away, *counts))
 
-    expected = {(home, away) for home in CLUBS for away in CLUBS if home != away}
-    if fixtures != expected:
+    clubs = {club for _, home, away, *_ in matches for club in (home, away)}
+    if season == CURRENT_SEASON:
+        if not matches or not clubs <= {club_name(name) for name in CURRENT_CLUBS}:
+            raise ValueError(f"Unexpected or empty results for {season_label(season)}.")
+    elif len(clubs) != 20 or len(matches) != 380:
         raise ValueError(f"Expected all 380 fixtures. The file contains {len(fixtures)} valid fixtures.")
     return matches
 
@@ -130,24 +144,27 @@ def query_season(matches):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Import the 2025–26 Premier League CSV.")
+    parser = argparse.ArgumentParser(description="Import a Premier League season CSV.")
+    parser.add_argument("--season", type=int, choices=SEASONS, default=DEFAULT_SEASON,
+                        help="Starting year of the season (default: 2025).")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--download", action="store_true", help="Fetch the CSV from Football-Data.co.uk.")
     mode.add_argument("--file", type=Path, help="Use a previously downloaded Football-Data CSV.")
     args = parser.parse_args()
     try:
-        raw = download_season() if args.download else args.file.read_bytes()
-        matches = parse_season(raw)
-        with NamedTemporaryFile(dir=LOCAL_CSV.parent, suffix=".tmp", delete=False) as handle:
+        raw = download_season(args.season) if args.download else args.file.read_bytes()
+        matches = parse_season(raw, args.season)
+        destination = local_csv(args.season)
+        with NamedTemporaryFile(dir=destination.parent, suffix=".tmp", delete=False) as handle:
             temporary = Path(handle.name)
         try:
             temporary.write_bytes(raw)
-            temporary.replace(LOCAL_CSV)
+            temporary.replace(destination)
         finally:
             temporary.unlink(missing_ok=True)
     except (OSError, ValueError) as exc:
         parser.exit(1, f"Import failed: {exc}\n")
-    print(f"Validated {len(matches)} matches across {len(CLUBS)} clubs.")
+    print(f"Validated {len(matches)} matches for {season_label(args.season)}.")
 
 
 if __name__ == "__main__":

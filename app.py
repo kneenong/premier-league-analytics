@@ -1,4 +1,4 @@
-"""Streamlit dashboard for the 2025–26 men's Premier League."""
+"""Historical results and a season forecast for the men's Premier League."""
 
 from base64 import b64encode
 from html import escape
@@ -8,7 +8,11 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from season_data import ARCHIVE, LOCAL_CSV, SEASON, VENUES, download_season, parse_season, query_season
+from forecast import PRIOR_MATCHES, SIMULATIONS, season_projection
+from season_data import (
+    ARCHIVE, CURRENT_CLUBS, CURRENT_SEASON, DEFAULT_SEASON, SEASONS, VENUES,
+    club_name, download_season, local_csv, parse_season, query_season, season_label,
+)
 
 ROOT = Path(__file__).parent
 COLORS = ["#c7f45c", "#7cd7fd"]
@@ -34,39 +38,43 @@ LOG_COLUMNS = {
 
 
 @st.cache_data(show_spinner=False)
-def load_season(raw):
-    return query_season(parse_season(raw))
+def load_season(raw, season):
+    return parse_season(raw, season)
 
 
-@st.cache_data(ttl="1d", show_spinner="Loading the 2025–26 season…")
-def load_online_season():
-    return load_season(download_season())
+@st.cache_data(ttl="1h", show_spinner="Loading season results…")
+def load_online_season(season):
+    return load_season(download_season(season), season)
 
 
-def dashboard_data():
-    if LOCAL_CSV.is_file():
-        return load_season(LOCAL_CSV.read_bytes())
+def season_results(season):
+    path = local_csv(season)
+    return load_season(path.read_bytes(), season) if path.is_file() else load_online_season(season)
 
-    if not st.session_state.get("season_source_unavailable"):
+
+def dashboard_data(season):
+    failure_key = f"season_source_unavailable_{season}"
+    if not st.session_state.get(failure_key):
         try:
-            return load_online_season()
+            return season_results(season)
         except (OSError, ValueError):
-            st.session_state["season_source_unavailable"] = True
+            st.session_state[failure_key] = True
 
     st.warning("The season data source is temporarily unavailable. Try again or upload the season CSV.")
-    if st.button("Retry download"):
-        st.session_state.pop("season_source_unavailable", None)
+    if st.button("Retry download", key=f"retry_{season}"):
+        st.session_state.pop(failure_key, None)
         st.rerun()
     st.link_button("Open the season archive", ARCHIVE)
-    upload = st.file_uploader(f"Upload the {SEASON} Premier League CSV", type=["csv"])
-    return load_season(upload.getvalue()) if upload is not None else None
+    upload = st.file_uploader(f"Upload the {season_label(season)} Premier League CSV", type=["csv"],
+                              key=f"upload_{season}")
+    return load_season(upload.getvalue(), season) if upload is not None else None
 
 
 def masthead():
     st.html(f"""
         <div class="masthead">
           <div class="wordmark"><span class="mark" aria-hidden="true">PL</span> League Analytics</div>
-          <span class="season-label">{SEASON} · Men's Premier League</span>
+          <span class="season-label">Men's Premier League</span>
         </div>
     """)
 
@@ -78,7 +86,7 @@ def hero():
         <section class="hero">
           <div class="hero-copy">
             <h1>Premier League<br>by the numbers.</h1>
-            <p>Explore all 20 clubs. Compare how they performed at home and away.</p>
+            <p>Explore results across seasons and compare clubs at home and away.</p>
           </div>
           <div class="hero-image">
             <img src="data:image/jpeg;base64,{encoded}" alt="Illustration of a floodlit football stadium at dusk">
@@ -102,11 +110,16 @@ def overview(rows, venue):
     with direction_area:
         direction = st.selectbox("Order", ["Highest first", "Lowest first"], index=0)
 
+    if not rows:
+        st.info("There are no recorded matches for this venue yet.")
+        return
     table = pd.DataFrame(rows).loc[:, list(SUMMARY_COLUMNS)]
     if search:
         table = table[table["club"].str.casefold().str.contains(search, regex=False)]
     table = table.sort_values(sort_by, ascending=direction == "Lowest first", kind="stable")
-    st.caption(f"{len(table)} of 20 clubs · {venue} · {rows[0]['played']} matches per club")
+    played = [row["played"] for row in rows]
+    match_count = str(min(played)) if min(played) == max(played) else f"{min(played)}–{max(played)}"
+    st.caption(f"{len(table)} of {len(rows)} clubs · {venue} · {match_count} matches per club")
     if table.empty:
         st.info("No clubs match that search.")
         return
@@ -145,8 +158,12 @@ def trend_data(logs, clubs, metric):
 def season_trend(logs, clubs):
     st.header("Season trends")
     metric = st.selectbox("Trend metric", TREND_METRICS)
+    trend = trend_data(logs, clubs, TREND_METRICS[metric])
+    if trend.empty:
+        st.info("A club needs five recorded fixtures in this venue to plot a trend.")
+        return
     st.caption("Each point averages the previous five selected fixtures, including the fixture on that date.")
-    chart = alt.Chart(trend_data(logs, clubs, TREND_METRICS[metric])).mark_line(
+    chart = alt.Chart(trend).mark_line(
         point=alt.OverlayMarkDef(size=37, filled=True), strokeWidth=2.4
     ).encode(
         x=alt.X("date:T", title=None, axis=alt.Axis(format="%b", tickCount=7)),
@@ -177,6 +194,9 @@ def match_log(logs, clubs):
 def compare(rows, logs):
     st.header("Compare clubs")
     clubs = {row["club"]: row for row in rows}
+    if len(clubs) < 2:
+        st.info("Two clubs with recorded matches are needed for this comparison.")
+        return
     left, right = st.columns(2)
     with left:
         first = st.selectbox("First club", sorted(clubs), index=0, key="first_club")
@@ -214,23 +234,72 @@ def methodology():
 """)
 
 
+@st.cache_data(show_spinner="Simulating the remaining fixtures…")
+def project(previous, played):
+    clubs = {club_name(name) for name in CURRENT_CLUBS}
+    return season_projection(previous, played, clubs)
+
+
+def forecast_view():
+    st.header(f"{season_label(CURRENT_SEASON)} season forecast")
+    try:
+        played = season_results(CURRENT_SEASON)
+        previous = season_results(CURRENT_SEASON - 1)
+    except (OSError, ValueError):
+        st.warning("The forecast needs both the current results and last season’s results.")
+        if st.button("Retry forecast"):
+            st.rerun()
+        st.link_button("Open the season archive", ARCHIVE)
+        return
+
+    latest = pd.Timestamp(max(match[0] for match in played)).strftime("%d %b %Y")
+    st.caption(f"Results through {latest} · {len(played)} played · {380 - len(played)} remaining")
+    table = pd.DataFrame(project(previous, played)).sort_values(["Average finish", "Club"])
+    st.dataframe(
+        table, hide_index=True, width="stretch", height=650,
+        column_config={
+            "Projected points": st.column_config.NumberColumn(format="%.1f"),
+            "Average finish": st.column_config.NumberColumn(format="%.1f"),
+            **{name: st.column_config.NumberColumn(format="percent")
+               for name in ("Title", "Top four", "Bottom three")},
+        },
+    )
+    with st.expander("How the forecast works"):
+        st.markdown(f"""
+The model holds played results fixed and simulates the remaining home-and-away pairings
+**{SIMULATIONS:,} times**. It estimates home and away scoring from each club's goals scored
+and conceded. Last season contributes the equivalent of {PRIOR_MATCHES} matches per venue.
+Clubs with no Premier League results last season start at the league average.
+
+The **80% points range** runs from the 10th to the 90th percentile of simulated points.
+The probability columns show how often each finish occurred. Simulated tables break ties
+by goal difference, then goals scored, with exact ties resolved at random. The model uses
+match results and does not account for injuries, transfers or points deductions.
+""")
+    methodology()
+
+
 def main():
     st.set_page_config(page_title="Premier League Analytics", layout="wide")
     st.html(f"<style>{(ROOT / 'dashboard.css').read_text(encoding='utf-8')}</style>")
     masthead()
+    page = st.radio("Dashboard view", ["League overview", "Compare clubs", "Season forecast"],
+                    horizontal=True, label_visibility="collapsed", key="page")
+    if page == "Season forecast":
+        forecast_view()
+        return
+    season = st.selectbox("Season", SEASONS, index=SEASONS.index(DEFAULT_SEASON),
+                          format_func=season_label, key="season")
+    if page == "League overview":
+        hero()
     try:
-        data = dashboard_data()
+        matches = dashboard_data(season)
     except (OSError, ValueError) as exc:
         st.error(str(exc))
         return
-    if data is None:
-        hero()
+    if matches is None:
         return
-    league, logs = data
-    page = st.radio("Dashboard view", ["League overview", "Compare clubs"],
-                    horizontal=True, label_visibility="collapsed", key="page")
-    if page == "League overview":
-        hero()
+    league, logs = query_season(matches)
     venue = venue_control()
     if page == "Compare clubs":
         compare(league[venue], logs[venue])
