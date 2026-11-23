@@ -1,0 +1,4 @@
+__pycache__/
+.venv/
+season-2025-26.csv
+*.tmp
